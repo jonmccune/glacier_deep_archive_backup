@@ -62,6 +62,9 @@ if [[ "$BACKUP_MODE" == zfs_stream ]]; then
     ZFS_SEND_SNAPSHOT=$ZFS_SEND_DATASET@snapshot-aws-$TIMESTAMP
     ZFS_SEND_RECURSIVE=${ZFS_SEND_RECURSIVE:-1}
     ZFS_SEND_EXTRA_ARGS=${ZFS_SEND_EXTRA_ARGS:-}
+    # Snapshot exactly what is sent. ZFS_SEND_DATASET may be a subtree of the pool,
+    # there is no point in snapshotting the rest of it.
+    SNAPSHOT=$ZFS_SEND_SNAPSHOT
     SNAPSHOT_RECURSIVE=$ZFS_SEND_RECURSIVE
 fi
 

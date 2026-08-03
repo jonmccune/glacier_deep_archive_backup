@@ -8,6 +8,7 @@ shift
 
 case "$SUBCOMMAND" in
     snapshot|destroy)
+        echo "zfs $SUBCOMMAND $*" >>"$GDAB_TEST_DIR/${SUBCOMMAND}_invocations"
         exit 0
         ;;
     send)

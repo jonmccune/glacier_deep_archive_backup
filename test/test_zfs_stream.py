@@ -627,9 +627,14 @@ def test_end_to_end_backup_and_restore(work_path):
     if len(chunk_keys) != 3:
         raise TestException(f'Expected 3 chunks, got {chunk_keys} (all keys: {keys})')
 
-    # The snapshot must be taken and sent recursively
-    with open(os.path.join(work_path, 'send_invocations'), 'rt') as f:
-        assert '-R' in f.read()
+    # The snapshot must be taken, sent and destroyed recursively
+    expected_invocations = {'snapshot_invocations': 'zfs snapshot -r tank@',
+                            'send_invocations': '-R tank@',
+                            'destroy_invocations': 'zfs destroy -r tank@'}
+    for name, expected in expected_invocations.items():
+        with open(os.path.join(work_path, name), 'rt') as f:
+            content = f.read()
+        assert expected in content, f'{name}: {content}'
 
     # The uploaded restore config must be the one for this mode
     restore_configs = [key for key in keys if key.endswith('.sh')]
@@ -704,6 +709,38 @@ def test_end_to_end_resume(work_path):
     manifest = extract_manifest_archive(os.path.join(bucket_path, manifest_key))
     assert manifest.complete
     assert manifest.uploaded_bytes() == len(data)
+
+
+def test_end_to_end_single_dataset(work_path):
+    '''Backing up one dataset instead of the whole pool, non-recursively.'''
+    make_stream_file(work_path, 1024 * 1024)
+    repo_path = make_test_repo(work_path)
+    env = make_env(work_path, repo_path)
+    config_path = write_backup_config(repo_path, work_path, 1,
+                                      extra=('ZFS_SEND_DATASET=tank/vms\n'
+                                             'ZFS_SEND_RECURSIVE=0\n'))
+
+    cp = subprocess.run(('impl/do_backup_to_aws.sh', 'scratch', config_path),
+                        cwd=repo_path, env=env, check=False, capture_output=True,
+                        text=True)
+    if cp.returncode != 0:
+        raise TestException(f'Backup failed:\n{cp.stdout}\n{cp.stderr}')
+
+    bucket_path = env['GDAB_BUCKET_DIR']
+    keys = sorted(os.path.relpath(os.path.join(root, file_), bucket_path)
+                  for root, _, files in os.walk(bucket_path) for file_ in files)
+    chunk_keys = [key for key in keys if key.endswith('.zfs.zstd.gpg')
+                  and '.manifest' not in key]
+    assert [os.path.basename(key) for key in chunk_keys] \
+        == ['tank_vms_00000.zfs.zstd.gpg'], keys
+
+    # Only the sent dataset is snapshotted, and neither that nor the send is recursive
+    for name in ('snapshot_invocations', 'send_invocations', 'destroy_invocations'):
+        with open(os.path.join(work_path, name), 'rt') as f:
+            content = f.read()
+        assert 'tank/vms@' in content, f'{name}: {content}'
+        assert '-r' not in content, f'{name}: {content}'
+        assert '-R' not in content, f'{name}: {content}'
 
 
 if __name__ == '__main__':
