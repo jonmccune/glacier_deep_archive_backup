@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -86,6 +87,13 @@ def clean_multipart_uploads(s3_bucket):
             subprocess.run(cmd, check=True)
 
 
+def sanitize_archive_name(name):
+    # Archive names end up as S3 keys and as local filenames, so restrict them to a
+    # conservative character set
+    name = re.sub('[^a-zA-Z0-9_-]', '_', name)
+    return name.rstrip('_')
+
+
 def make_set_info_filename(list_file):
     info_file = os.path.splitext(list_file)[0] + '.info'
     return info_file
@@ -117,6 +125,33 @@ class SealAction():
 
     def is_skip_sealed(self):
         return self.action == SealAction.SKIP_SEALED
+
+
+class BackupMode():
+    '''Which data source a backup reads from, see the README.
+
+    - FILES: The ZFS snapshot is mounted and its files are packed with `tar`. This is
+      the default and the only mode that supports sealing and duplicity.
+    - ZFS_STREAM: A `zfs send` stream of the snapshot is backed up block level. This
+      also covers zvols and all ZFS metadata, which the file level mode cannot handle.
+    '''
+
+    FILES, ZFS_STREAM = range(2)
+
+    def __init__(self):
+        backup_mode_str = os.environ.get('BACKUP_MODE', 'files')
+        try:
+            self.mode = {'files': BackupMode.FILES,
+                         'zfs_stream': BackupMode.ZFS_STREAM}[backup_mode_str.lower()]
+        except KeyError:
+            # pylint: disable=raise-missing-from
+            raise BackupException(f'Invalid backup mode {backup_mode_str}')
+
+    def is_files(self):
+        return self.mode == BackupMode.FILES
+
+    def is_zfs_stream(self):
+        return self.mode == BackupMode.ZFS_STREAM
 
 
 if __name__ == '__main__':

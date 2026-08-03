@@ -25,7 +25,7 @@ import binpacking
 
 from impl.tools import (GDAB_SEALED_MARKER, NO_BACKUP_MARKER, BackupException,
                         SealAction, glob_backup_paths_and_check, make_set_info_filename,
-                        size_to_string)
+                        sanitize_archive_name, size_to_string)
 
 SEAL_AFTER_BACKUP, SKIP_SEALED = range(2)
 
@@ -50,9 +50,7 @@ class SetWriter():
             prefix = items[0][0:i]
 
         name = prefix.replace(self.snapshot_path, self.zfs_pool)
-        name = re.sub('[^a-zA-Z0-9_-]', '_', name)
-        name = name.rstrip('_')
-        return name
+        return sanitize_archive_name(name)
 
     def write_set(self, set_index, num_sets, items, size, num_dirs, num_files):
         print(f'Set {set_index+1}/{num_sets}: {len(items)} path(s), {size_to_string(size)}'
