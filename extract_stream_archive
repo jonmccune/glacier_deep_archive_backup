@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Decrypts and decompresses one chunk of a `zfs send` stream backup and writes the raw
+# stream to stdout. Concatenating all chunks of a backup in ascending order reproduces
+# the original `zfs send` stream, which can be piped into `zfs receive`.
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: ./extract_stream_archive ARCHIVE"
+    echo "  The raw stream is written to stdout, e.g. for piping into 'zfs receive':"
+    echo "  Example: for f in tank_0*.zfs.zstd.gpg; do ./extract_stream_archive \"\$f\";" \
+        "done | sudo zfs receive -F -u tank_restore"
+    exit 1
+fi
+
+ARCHIVE=$1
+if [[ "$ARCHIVE" != /* ]]; then
+    ARCHIVE="$PWD/$ARCHIVE"
+fi
+
+pushd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" >/dev/null
+trap 'popd >/dev/null' EXIT
+
+gpg -d --passphrase-file config/passphrase.txt --batch --quiet "$ARCHIVE" | zstd -d
