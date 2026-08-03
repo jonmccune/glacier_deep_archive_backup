@@ -42,6 +42,16 @@ state of the file system during upload (which can take days). So this will only 
 data on ZFS pools, although it could be adapted to work for other snapshotting file
 systems or by losening the consistency requirements.
 
+There are two backup modes, selected with `BACKUP_MODE` in your backup config:
+
+- `files` (the default): The snapshot is mounted and the files you list are packed into
+  `tar` archives. This is the mode all of the documentation below refers to unless
+  stated otherwise, and the only one that supports sealing and incremental backups.
+- `zfs_stream`: A `zfs send` stream of a whole pool or dataset is backed up block level,
+  and restored with `zfs receive`. This covers everything ZFS knows about, including
+  zvols, dataset properties and encryption, none of which a file level backup can
+  capture. See [Whole-Pool Backups With `zfs send`](#whole-pool-backups-with-zfs-send).
+
 # Installation
 
 ## Prerequisites
@@ -109,6 +119,7 @@ permissions for reading the data to be backed up. Only the following operations 
 executed as `root`, for which the user must have `sudo` privileges:
 - Creating, mounting, unmounting and destroying the ZFS snapshot
 - Creating the path for the snapshot mount
+- `zfs send`/`zfs receive` when using `BACKUP_MODE=zfs_stream`
 - For `chattr` when using sealing
 - For the fuzz test, creating a `tmpfs`
 
@@ -125,6 +136,9 @@ tank_pics_000.list_contents.tar.zstd.gpg
 tank_pics_000.tar.zstd.gpg
 # The tar archive, zstd compressed, aes256 encrypted
 ```
+
+(With `BACKUP_MODE=zfs_stream` the directory contains numbered stream chunks and a
+manifest instead, see [below](#whole-pool-backups-with-zfs-send).)
 
 You should store everything you need to restore the backup in a safe location:
 
@@ -214,6 +228,130 @@ SEAL_ACTION=skip_sealed
     ```
   - Make sure that data is covered by a regular backup.
 
+### Whole-Pool Backups With `zfs send`
+
+The default `files` mode mounts the snapshot and packs files with `tar`. That covers
+everything you can see in a file system, but not everything ZFS stores:
+
+- **zvols**, i.e. raw block devices used as VM disks. There is no directory tree to
+  walk and no file to `tar` up.
+- Dataset **properties** (`recordsize`, `compression`, quotas, mountpoints, ...),
+  encryption roots and keys, and the dataset layout itself.
+- Snapshots other than the one being backed up.
+
+With `BACKUP_MODE=zfs_stream` the data source is a `zfs send` stream instead. Everything
+after that is the same machinery the file mode uses: the stream is split into chunks of
+`UPLOAD_LIMIT_MB`, each chunk is `zstd` compressed and `gpg` AES256 encrypted, uploaded
+to Deep Archive, and a failed backup is continued with `./backup_resume`.
+
+Setting it up:
+
+```
+config/backup_tank.sh:
+
+ZFS_POOL=tank
+BACKUP_MODE=zfs_stream
+
+# Optional, defaults to ZFS_POOL. Set to back up a subtree, e.g. tank/vms
+ZFS_SEND_DATASET=tank
+
+# Optional, defaults to 1: send the dataset and all its descendants (`zfs send -R`)
+ZFS_SEND_RECURSIVE=1
+
+# Optional, extra arguments for `zfs send`, see below
+ZFS_SEND_EXTRA_ARGS=''
+```
+
+`BACKUP_PATHS`, `SNAPSHOT_PATH` and `SEAL_ACTION` are not used in this mode. Then run
+`./backup_scratch config/backup_tank.sh` as usual.
+
+Your S3 bucket will contain the numbered chunks of the stream plus a manifest:
+
+```
+tank_00000.zfs.zstd.gpg
+tank_00001.zfs.zstd.gpg
+
+# Chunks of the `zfs send` stream, zstd compressed, aes256 encrypted.
+# Concatenating them in ascending order reproduces the stream.
+
+tank.manifest.json.zstd.gpg
+
+# Encrypted list of the chunks with their sizes and sha256 sums, and the
+# snapshot they came from. Restore uses it to know how many chunks to
+# expect, in which order, and to verify each one.
+```
+
+#### Notes
+
+- **The stream is never written to local disk in full.** Chunks are produced as the
+  stream is read, so the pool can be far larger than the free space on the machine
+  running the backup. As for the file mode, `BUFFER_PATH_BASE` needs room for about
+  two chunks.
+- **A `zfs send` stream is all-or-nothing.** You cannot restore a single file from it
+  without receiving the whole thing first, and a lost chunk in the middle makes
+  everything after it useless. This is the trade-off for capturing zvols and ZFS
+  metadata. If you mainly care about being able to get individual files back cheaply,
+  use the `files` mode, possibly in addition.
+- **Resuming re-reads the pool.** `zfs send` cannot be restarted in the middle of a
+  stream, so `./backup_resume` runs it again from the start and discards the part that
+  was already uploaded, rather than re-uploading it. Reading is much cheaper than
+  uploading, but it is not free. Each skipped chunk is checked against the sha256 in
+  the manifest, so if your ZFS version does not produce a byte identical stream on the
+  second run, you get an error instead of a backup that cannot be received.
+- **Do not use sealing or duplicity with this mode.** Sealing operates on directories,
+  and duplicity on files. Combining them is rejected.
+- Useful `ZFS_SEND_EXTRA_ARGS`:
+    - `-w` — raw send. **Required for encrypted datasets** if you want them to stay
+      encrypted with their own key, and the only way to send them at all when the key
+      is not loaded.
+    - `-L` — send large blocks, needed if any dataset has `recordsize` > 128k.
+    - `-c` — send already compressed blocks as they are. Saves CPU, but leaves `zstd`
+      less to work with.
+    - `-e` — more compact stream for embedded blocks.
+- The size shown in the progress display comes from `zfs send -nP`, which is an
+  estimate. The percentages can therefore go slightly over or stop slightly under 100%.
+- All `zfs` commands are run through `sudo`, like the snapshot handling of the file
+  mode.
+
+#### Restoring a `zfs send` Backup
+
+The generated restore config in your bucket already has `BACKUP_MODE=zfs_stream` set.
+Fill in the target and run `./restore` as usual:
+
+```
+config/restore.sh:
+
+BACKUP_MODE=zfs_stream
+
+# The dataset to receive into. Its contents will be DESTROYED, see below
+ZFS_RECV_TARGET=tank_restore
+
+# -F is required for the recursive streams this tool sends, -u avoids mounting
+# the received file systems during the restore
+ZFS_RECV_EXTRA_ARGS='-F -u'
+```
+
+- **`ZFS_RECV_TARGET` must not be a dataset holding data you care about.** `zfs receive
+  -F` rolls the target back and destroys anything in it that is not in the stream.
+  Restore into a fresh pool or dataset.
+- The chunks are downloaded and received strictly in order, since together they are a
+  single stream. Restores for all chunks are requested up front and run in parallel on
+  the AWS side, so this does not make the 12/48 hour wait any longer, and the buffer
+  only ever holds one chunk.
+- Each chunk is verified against its sha256 from the manifest before it reaches
+  `zfs receive`.
+- If a backup was interrupted and never resumed, restore warns that the manifest is
+  incomplete and receives what is there. `zfs receive` will reject the truncated
+  stream, which is the correct outcome.
+
+To restore manually, e.g. only to check that the data is good, download the chunks and
+pipe them through `extract_stream_archive` in ascending order:
+
+```
+for f in tank_0*.zfs.zstd.gpg; do ./extract_stream_archive "$f"; done \
+    | sudo zfs receive -F -u tank_restore
+```
+
 ### Incremental Backups
 
 As mentioned, you always pay for 180 days for each byte you allocate. So the most
@@ -268,6 +406,10 @@ With sealing and incremental backups, your backup strategy looks as follows:
     - Decryption
     - Extraction
 - Restore will incur costs for restore and transfer. See above for a detailed breakdown.
+- Set `BACKUP_MODE` in the restore config to what the backup was made with. For
+  `zfs_stream` backups the archives are received with `zfs receive` instead of being
+  extracted, see
+  [Restoring a `zfs send` Backup](#restoring-a-zfs-send-backup).
 
 Should you wish to only restore some files to save time or money you can follow these
 manual steps:
@@ -276,7 +418,9 @@ manual steps:
   Standard and Bulk retrieval (Bulk $2.56/TiB, Standard $20.48/TiB).
 - Once the file is available, download it
 - Use `./extract_archive ARCHIVE DEST_PATH` to decrypt and extract it (e.g.
-  `./extract_archive tank_pics_000.tar.zstd.gpg /tank_restore`)
+  `./extract_archive tank_pics_000.tar.zstd.gpg /tank_restore`). For a
+  `BACKUP_MODE=zfs_stream` backup, use `./extract_stream_archive ARCHIVE` instead, see
+  [above](#restoring-a-zfs-send-backup).
 
 ### Restoring Incremental Backups
 
@@ -304,10 +448,12 @@ parts.
     You can check the full details on the [pricing page](https://aws.amazon.com/s3/pricing/).
 
 - Symlinks are *not* followed. Therefore, links pointing to files not covered by the
-  paths backed up will not be considered!
+  paths backed up will not be considered! (Not applicable to `BACKUP_MODE=zfs_stream`,
+  which does not look at files at all.)
 
 - No file splitting: The largest file must fit into `UPLOAD_LIMIT_MB`. This is checked
-  at the beginning.
+  at the beginning. (Not applicable to `BACKUP_MODE=zfs_stream`, which splits the
+  stream at exactly `UPLOAD_LIMIT_MB`.)
 
 - There is a progress display which works as follows:
 
