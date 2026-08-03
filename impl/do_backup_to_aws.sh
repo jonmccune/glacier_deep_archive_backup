@@ -54,18 +54,15 @@ SNAPSHOT=$ZFS_POOL@snapshot-aws-$TIMESTAMP
 SET_PATH=state/sets
 STATE_FILE=state/fs.state
 
-# `zfs send -R` needs the snapshot to exist on all descendant datasets
-ZFS_SNAPSHOT_ARGS=()
-ZFS_DESTROY_ARGS=()
+# `zfs send -R` needs the snapshot to exist on all descendant datasets, so take and
+# destroy it recursively then
+SNAPSHOT_RECURSIVE=0
 if [[ "$BACKUP_MODE" == zfs_stream ]]; then
     ZFS_SEND_DATASET=${ZFS_SEND_DATASET:-$ZFS_POOL}
     ZFS_SEND_SNAPSHOT=$ZFS_SEND_DATASET@snapshot-aws-$TIMESTAMP
     ZFS_SEND_RECURSIVE=${ZFS_SEND_RECURSIVE:-1}
     ZFS_SEND_EXTRA_ARGS=${ZFS_SEND_EXTRA_ARGS:-}
-    if [[ "$ZFS_SEND_RECURSIVE" == 1 ]]; then
-        ZFS_SNAPSHOT_ARGS=(-r)
-        ZFS_DESTROY_ARGS=(-r)
-    fi
+    SNAPSHOT_RECURSIVE=$ZFS_SEND_RECURSIVE
 fi
 
 BUFFER_PATH="$BUFFER_PATH_BASE/backup_aws_buffer"
@@ -86,7 +83,11 @@ function cleanup()
             "resume, please destroy the snapshot manually."
     else
         echo "Destroying snapshot $SNAPSHOT"
-        sudo zfs destroy "${ZFS_DESTROY_ARGS[@]}" "$SNAPSHOT"
+        if [[ "$SNAPSHOT_RECURSIVE" == 1 ]]; then
+            sudo zfs destroy -r "$SNAPSHOT"
+        else
+            sudo zfs destroy "$SNAPSHOT"
+        fi
     fi
 }
 
@@ -96,7 +97,11 @@ if [[ "$MODE" == scratch ]] || [[ "$MODE" == duplicity_full ]] || [[ "$MODE" == 
     mkdir -p "$SET_PATH"
     rm -f "$STATE_FILE"
 
-    sudo zfs snapshot "${ZFS_SNAPSHOT_ARGS[@]}" "$SNAPSHOT"
+    if [[ "$SNAPSHOT_RECURSIVE" == 1 ]]; then
+        sudo zfs snapshot -r "$SNAPSHOT"
+    else
+        sudo zfs snapshot "$SNAPSHOT"
+    fi
 fi
 
 if [[ "$BACKUP_MODE" == files ]]; then
