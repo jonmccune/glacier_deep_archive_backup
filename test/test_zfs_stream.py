@@ -12,12 +12,12 @@ import pytest
 from impl import do_restore
 from impl.tools import BackupException, BackupMode
 from impl.upload_sets import package_and_upload_stream
-from impl.zfs_stream import (MANIFEST_SUFFIX, StreamManifest, ZfsSendStream,
-                             build_manifest_archive, build_stream_archive,
-                             estimate_stream_size, extract_manifest_archive,
-                             extract_stream_archive, make_archive_prefix,
-                             make_receive_cmd, make_send_cmd, parse_send_estimate,
-                             split_extra_args)
+from impl.zfs_stream import (MANIFEST_SUFFIX, StreamManifest, ZfsReceiveStream,
+                             ZfsSendStream, build_manifest_archive,
+                             build_stream_archive, estimate_stream_size,
+                             extract_manifest_archive, extract_stream_archive,
+                             make_archive_prefix, make_receive_cmd, make_send_cmd,
+                             parse_send_estimate, split_extra_args)
 
 SCRIPT_PATH = os.path.dirname(os.path.abspath(__file__))
 ROOT_PATH = os.path.dirname(SCRIPT_PATH)
@@ -320,6 +320,35 @@ def test_send_failure_is_reported():
         stream.copy_chunk(None, CHUNK_SIZE)
         with pytest.raises(BackupException):
             stream.finish()
+
+
+def test_receive_roundtrip(work_path):
+    size = 3 * CHUNK_SIZE + 7
+    stream_file, data = make_stream_file(work_path, size)
+    manifest = chunk_stream(work_path, stream_file, size)
+    received_file = os.path.join(work_path, 'received.bin')
+
+    with ZfsReceiveStream(['sh', '-c', 'cat > "$0"', received_file]) as receive_stream:
+        for chunk in manifest.chunks:
+            extract_stream_archive(os.path.join(work_path, chunk['archive_name']),
+                                   receive_stream.stdin, chunk['sha256'])
+        receive_stream.finish()
+
+    with open(received_file, 'rb') as f:
+        assert f.read() == data
+
+
+def test_receive_failure_is_reported(work_path):
+    stream_file, _ = make_stream_file(work_path, 1000)
+    manifest = chunk_stream(work_path, stream_file, 1000)
+    archive_file = os.path.join(work_path, manifest.chunks[0]['archive_name'])
+
+    # A `zfs receive` that rejects the stream must not be reported as a success
+    with ZfsReceiveStream(['sh', '-c', 'cat >/dev/null; exit 1']) as receive_stream:
+        extract_stream_archive(archive_file, receive_stream.stdin,
+                               manifest.chunks[0]['sha256'])
+        with pytest.raises(BackupException):
+            receive_stream.finish()
 
 
 def test_stop_aborts_copy(work_path):

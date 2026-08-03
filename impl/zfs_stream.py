@@ -279,7 +279,12 @@ class ZfsReceiveStream():
         if self.process.poll() is None:
             self.process.kill()
         if not self.process.stdin.closed:
-            self.process.stdin.close()
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                # `zfs receive` already went away, whatever made it do so is the error
+                # worth reporting, not this
+                pass
         self.process.wait()
         return False
 
@@ -288,6 +293,7 @@ class ZfsReceiveStream():
         return self.process.stdin
 
     def finish(self):
+        '''Waits for `zfs receive` to exit and raises when it failed.'''
         self.process.stdin.close()
         returncode = self.process.wait()
         if returncode != 0:
