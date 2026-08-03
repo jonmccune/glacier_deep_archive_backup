@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+'''Test stub for the AWS CLI, backed by a directory in $GDAB_BUCKET_DIR.
+
+Only implements the calls GDAB makes, and only as far as the tests need them:
+objects are stored as files, restores complete immediately, and the two
+list-objects-v2 queries used by do_restore.py are special cased instead of
+implementing JMESPath.
+'''
+
+import json
+import os
+import shutil
+import sys
+
+BUCKET_DIR = os.environ['GDAB_BUCKET_DIR']
+DEEP_ARCHIVE_MARKER = '.deep_archive_keys'
+
+
+def object_path(key):
+    return os.path.join(BUCKET_DIR, key)
+
+
+def deep_archive_keys():
+    marker = os.path.join(BUCKET_DIR, DEEP_ARCHIVE_MARKER)
+    if not os.path.exists(marker):
+        return set()
+    with open(marker, 'rt') as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def all_keys(prefix):
+    keys = []
+    for root, _, files in os.walk(BUCKET_DIR):
+        for file_ in files:
+            key = os.path.relpath(os.path.join(root, file_), BUCKET_DIR)
+            if key != DEEP_ARCHIVE_MARKER and key.startswith(prefix):
+                keys.append(key)
+    keys.sort()
+    return keys
+
+
+def get_arg(argv, name, default=None):
+    if name not in argv:
+        return default
+    return argv[argv.index(name) + 1]
+
+
+def should_fail_deep_archive():
+    '''Lets a test simulate an upload failure after N chunks.'''
+    marker = os.environ.get('GDAB_FAIL_DEEP_ARCHIVE_AFTER')
+    if not marker or not os.path.exists(marker):
+        return False
+    with open(marker, 'rt') as f:
+        return len(deep_archive_keys()) >= int(f.read().strip())
+
+
+def cmd_s3_cp(argv):
+    src, dst = argv[0], argv[1]
+    if dst.startswith('s3://'):
+        key = dst.split('/', maxsplit=3)[3]
+        is_deep_archive = get_arg(argv, '--storage-class') == 'DEEP_ARCHIVE'
+        if is_deep_archive and should_fail_deep_archive():
+            print('aws stub: simulated upload failure', file=sys.stderr)
+            return 1
+        path = object_path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copyfile(src, path)
+        if is_deep_archive:
+            with open(os.path.join(BUCKET_DIR, DEEP_ARCHIVE_MARKER), 'at') as f:
+                print(key, file=f)
+    else:
+        key = src.split('/', maxsplit=3)[3]
+        path = object_path(key)
+        if not os.path.exists(path):
+            print(f'aws stub: no such key {key}', file=sys.stderr)
+            return 1
+        target = dst
+        if os.path.isdir(dst):
+            target = os.path.join(dst, os.path.basename(key))
+        shutil.copyfile(path, target)
+    return 0
+
+
+def cmd_list_objects(argv):
+    prefix = get_arg(argv, '--prefix', '')
+    query = get_arg(argv, '--query', '')
+    keys = all_keys(prefix)
+    if 'DEEP_ARCHIVE' in query:
+        deep = deep_archive_keys()
+        result = [[key, os.path.getsize(object_path(key))]
+                  for key in keys
+                  if key in deep]
+    elif 'ends_with' in query:
+        suffix = query.split("'")[1]
+        result = [key for key in keys if key.endswith(suffix)]
+    else:
+        print(f'aws stub: unhandled query {query}', file=sys.stderr)
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_head_object(argv):
+    del argv
+    # Restores always complete immediately
+    print(json.dumps({'Restore': 'ongoing-request="false"'}))
+    return 0
+
+
+def cmd_ok(argv):
+    del argv
+    # For list-multipart-uploads, no output means there is nothing to clean up
+    return 0
+
+
+COMMANDS = {
+    ('s3', 'cp'): cmd_s3_cp,
+    ('s3api', 'list-objects-v2'): cmd_list_objects,
+    ('s3api', 'list-multipart-uploads'): cmd_ok,
+    ('s3api', 'restore-object'): cmd_ok,
+    ('s3api', 'head-object'): cmd_head_object,
+    ('sts', 'get-caller-identity'): cmd_ok,
+}
+
+
+def main(argv):
+    command = COMMANDS.get(tuple(argv[:2]))
+    if command is None:
+        print(f'aws stub: unhandled command {argv}', file=sys.stderr)
+        return 1
+    return command(argv[2:])
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Test stub for zfs(8). The "pool" is the file $GDAB_TEST_DIR/pool.bin, a `zfs send`
+# stream is that file's content and `zfs receive` writes to $GDAB_TEST_DIR/received.bin.
+set -euo pipefail
+
+SUBCOMMAND=$1
+shift
+
+case "$SUBCOMMAND" in
+    snapshot|destroy)
+        exit 0
+        ;;
+    send)
+        ESTIMATE=0
+        for ARG in "$@"; do
+            if [[ "$ARG" == -*n* ]]; then
+                ESTIMATE=1
+            fi
+        done
+        echo "zfs send $*" >>"$GDAB_TEST_DIR/send_invocations"
+        if [[ "$ESTIMATE" == 1 ]]; then
+            # Machine parsable dry run output, as produced by `zfs send -nP`
+            printf 'full\tpool@snap\t%s\n' "$(wc -c <"$GDAB_TEST_DIR/pool.bin" | tr -d ' ')"
+            printf 'size\t%s\n' "$(wc -c <"$GDAB_TEST_DIR/pool.bin" | tr -d ' ')"
+            exit 0
+        fi
+        cat "$GDAB_TEST_DIR/pool.bin"
+        ;;
+    receive|recv)
+        echo "zfs receive $*" >>"$GDAB_TEST_DIR/receive_invocations"
+        cat >"$GDAB_TEST_DIR/received.bin"
+        ;;
+    *)
+        echo "zfs stub: unhandled subcommand $SUBCOMMAND" >&2
+        exit 1
+        ;;
+esac

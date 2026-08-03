@@ -21,6 +21,10 @@ from impl.zfs_stream import (MANIFEST_SUFFIX, StreamManifest, ZfsSendStream,
 
 NUM_UPLOAD_RETRIES = 3
 
+# How often the stream archiver checks whether the upload has caught up and it may
+# produce the next chunk. Also bounds how long stopping it takes.
+ARCHIVE_QUEUE_POLL_SEC = 1
+
 
 def get_list_files(set_path):
     list_files = []
@@ -367,7 +371,7 @@ def stream_archiver(archive_queue, stream, manifest, buffer_path, num_skip_chunk
         index = num_skip_chunks
         while True:
             while archive_queue.full():
-                if stream.stop_event.wait(5):
+                if stream.stop_event.wait(ARCHIVE_QUEUE_POLL_SEC):
                     return
 
             archive_name = manifest.make_archive_name(index)

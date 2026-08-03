@@ -70,6 +70,15 @@ def make_archive_prefix(snapshot):
     return sanitize_archive_name(dataset)
 
 
+def parse_send_estimate(output):
+    '''Extracts the size from `zfs send -nP` output, which ends in a `size <bytes>`.'''
+    for line in reversed(output.splitlines()):
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == 'size':
+            return int(fields[1])
+    return None
+
+
 def estimate_stream_size(snapshot, recursive=True, extra_args=()):
     '''Returns the estimated size of the stream in bytes, for progress reporting.
 
@@ -80,12 +89,11 @@ def estimate_stream_size(snapshot, recursive=True, extra_args=()):
     print(f"Running '{' '.join(cmd)}'")
     cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
     # Depending on the ZFS version the dry run output goes to stdout or stderr
-    for line in reversed((cp.stdout + cp.stderr).splitlines()):
-        fields = line.split()
-        if len(fields) == 2 and fields[0] == 'size':
-            return int(fields[1])
-    raise BackupException(f"Could not determine stream size for '{snapshot}',"
-                          f' output was:\n{cp.stdout}{cp.stderr}')
+    size = parse_send_estimate(cp.stdout + cp.stderr)
+    if size is None:
+        raise BackupException(f"Could not determine stream size for '{snapshot}',"
+                              f' output was:\n{cp.stdout}{cp.stderr}')
+    return size
 
 
 class StreamManifest():  # pylint: disable=too-many-instance-attributes
