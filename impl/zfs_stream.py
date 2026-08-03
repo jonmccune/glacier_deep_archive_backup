@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 
 from impl.tools import BackupException, sanitize_archive_name, size_to_string
 
@@ -191,13 +192,21 @@ class ZfsSendStream():
         self.cmd = list(cmd)
         self.process = None
         self.at_eof = False
+        self.aborted = False
         self.bytes_read = 0
+        # A chunk of UPLOAD_LIMIT_MB takes a while to read, so allow the consumer to
+        # abort in the middle of one instead of waiting for it to complete
+        self.stop_event = threading.Event()
 
     def __enter__(self):
         print(f"Running '{' '.join(self.cmd)}'")
         # pylint: disable=consider-using-with
         self.process = subprocess.Popen(self.cmd, stdout=subprocess.PIPE)
         return self
+
+    def stop(self):
+        '''Makes the next/current copy_chunk() return early.'''
+        self.stop_event.set()
 
     def __exit__(self, type_, value_, traceback_):
         if self.process.poll() is None:
@@ -212,11 +221,15 @@ class ZfsSendStream():
         '''Copies up to max_bytes from the stream to dst (None discards the data).
 
         Returns the number of bytes copied and their sha256. Copying fewer bytes than
-        requested means the end of the stream was reached.
+        requested means the end of the stream was reached, or stop() was called, which
+        is indicated by at_eof/aborted.
         '''
         hasher = hashlib.sha256()
         remaining = max_bytes
         while remaining > 0:
+            if self.stop_event.is_set():
+                self.aborted = True
+                break
             block = self.process.stdout.read(min(COPY_BLOCK_SIZE, remaining))
             if not block:
                 self.at_eof = True

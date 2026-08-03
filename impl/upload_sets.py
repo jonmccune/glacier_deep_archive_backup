@@ -8,10 +8,16 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
-from impl.tools import (BackupException, SealAction, clean_multipart_uploads,
-                        make_set_info_filename, normalize_bucket_dir, size_to_string,
-                        size_to_string_factor, size_to_unit)
+from impl.tools import (BackupException, BackupMode, SealAction,
+                        clean_multipart_uploads, make_set_info_filename,
+                        normalize_bucket_dir, size_to_string, size_to_string_factor,
+                        size_to_unit)
+from impl.zfs_stream import (MANIFEST_SUFFIX, StreamManifest, ZfsSendStream,
+                             build_manifest_archive, build_stream_archive,
+                             estimate_stream_size, make_archive_prefix, make_send_cmd,
+                             split_extra_args)
 
 NUM_UPLOAD_RETRIES = 3
 
@@ -334,11 +340,247 @@ def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra
     return num_errors
 
 
+def stream_archiver(archive_queue, stream, manifest, buffer_path, num_skip_chunks):
+    '''Produces the archives of a `zfs send` stream, see archiver() for the file mode.
+
+    The first num_skip_chunks chunks were already uploaded by an interrupted run.
+    `zfs send` cannot be restarted in the middle of a stream, so they are read and
+    discarded, which also verifies that the stream is reproducible.
+
+    Only reads manifest entries below num_skip_chunks, which the consumer never
+    modifies, so no locking is needed.
+
+    Returns without a result when the consumer called stream.stop(), in which case it
+    is no longer interested in one.
+    '''
+    archive_file = None
+    try:
+        for index in range(num_skip_chunks):
+            chunk = manifest.chunks[index]
+            print(f"Chunk {index+1}/{num_skip_chunks}: Skipping {chunk['archive_name']}"
+                  ', uploaded by a previous run')
+            num_bytes, sha256 = stream.copy_chunk(None, manifest.chunk_size_bytes)
+            if stream.aborted:
+                return
+            manifest.verify_chunk(index, num_bytes, sha256)
+
+        index = num_skip_chunks
+        while True:
+            while archive_queue.full():
+                if stream.stop_event.wait(5):
+                    return
+
+            archive_name = manifest.make_archive_name(index)
+            print(f'Chunk {index+1}: Packing {archive_name}')
+            archive_file = os.path.join(buffer_path, archive_name)
+
+            t0 = time.time()
+            num_bytes, sha256 = build_stream_archive(stream, archive_file,
+                                                     manifest.chunk_size_bytes)
+            archive_time_sec = time.time() - t0
+
+            if num_bytes == 0 or stream.aborted:
+                # The stream ended exactly at the previous chunk boundary, or the
+                # consumer gave up and the partial archive is worthless
+                os.unlink(archive_file)
+                archive_file = None
+                if stream.aborted:
+                    return
+                break
+
+            archive_queue.put((index, archive_name, archive_file, archive_time_sec,
+                               os.path.getsize(archive_file), num_bytes, sha256))
+            archive_file = None
+            index += 1
+
+            if stream.at_eof:
+                break
+
+        stream.finish()
+        archive_queue.put(True)  # All processed, success
+    except:  # pylint: disable=bare-except
+        traceback.print_exc()
+        if archive_file is not None and os.path.exists(archive_file):
+            os.unlink(archive_file)
+        archive_queue.put(False)  # Failure
+
+
+def drain_archive_queue(archive_queue):
+    '''Removes archives the consumer will not get to, so they do not fill up the disk.'''
+    while True:
+        try:
+            result = archive_queue.get(block=False)
+        except queue.Empty:
+            return
+        if result in (True, False):
+            continue
+        archive_file = result[2]
+        if os.path.exists(archive_file):
+            os.unlink(archive_file)
+
+
+def upload_manifest(manifest, manifest_file, buffer_path, uploader):
+    '''Uploads the manifest next to the chunks, so restore can find and verify them.
+
+    Uploaded after every chunk (it is tiny), so that even a backup that was aborted
+    halfway can be restored up to the point it got to.
+    '''
+    archive_name = manifest.make_manifest_archive_name()
+    archive_file = os.path.join(buffer_path, archive_name)
+    build_manifest_archive(manifest_file, archive_file)
+    try:
+        for i in range(NUM_UPLOAD_RETRIES):
+            print(f'Uploading manifest {archive_name}, attempt {i+1}')
+            try:
+                uploader.upload(archive_file, archive_name, deep_archive=False)
+                return 0
+            except subprocess.CalledProcessError as e:
+                print(f'Error during upload: {e}')
+        return 1
+    finally:
+        os.unlink(archive_file)
+
+
+def package_and_upload_stream(stream, manifest, manifest_file, buffer_path, uploader):  # pylint: disable=too-many-statements
+    num_errors = 0
+    num_skip_chunks = len(manifest.chunks)
+
+    progress = ProgressPrinter(manifest.total_size_bytes)
+    # Account for what a previous, interrupted run already uploaded. The times stay at
+    # zero, so rates and ETA only show up once a new chunk has been processed.
+    progress.archived_bytes = manifest.uploaded_bytes()
+    progress.archive_size_bytes = manifest.uploaded_archive_bytes()
+    progress.gross_uploaded_bytes = progress.archived_bytes
+    progress.net_uploaded_bytes = progress.archive_size_bytes
+
+    # Build the next archive while the current one is uploaded, as for the file mode.
+    # The queue size also bounds how far `zfs send` may run ahead of the upload.
+    archive_queue = queue.Queue(maxsize=1)
+    archive_thread = threading.Thread(target=stream_archiver,
+                                      args=(archive_queue, stream, manifest, buffer_path,
+                                            num_skip_chunks))
+
+    archive_thread.daemon = True
+    archive_thread.start()
+
+    try:
+        while True:
+            result = archive_queue.get()
+            if result in (True, False):
+                if result is False:
+                    num_errors += 1
+                break
+            (index, archive_name, archive_file, archive_time_sec_job,
+             archive_size_bytes_job, chunk_size_bytes_job, sha256) = result
+            upload_success = False
+
+            try:
+                progress.archive_time_sec += archive_time_sec_job
+                progress.archive_size_bytes += archive_size_bytes_job
+                progress.archived_bytes += chunk_size_bytes_job
+                progress.print_status()
+
+                for i in range(NUM_UPLOAD_RETRIES):
+                    print(f'Chunk {index+1}: Uploading {archive_name}, attempt {i+1}')
+
+                    try:
+                        file_upload_time_sec = uploader.upload(archive_file,
+                                                               archive_name,
+                                                               deep_archive=True)
+
+                        upload_success = True
+                        progress.net_uploaded_bytes += archive_size_bytes_job
+                        progress.gross_uploaded_bytes += chunk_size_bytes_job
+                        progress.upload_time_sec += file_upload_time_sec
+                        break
+                    except subprocess.CalledProcessError as e:
+                        print(f'Error during upload: {e}')
+                    finally:
+                        progress.print_status()
+            finally:
+                # Delete archive in any case, retry will recreate it and we need the
+                # space
+                os.unlink(archive_file)
+                if upload_success:
+                    manifest.add_chunk(index, archive_name, chunk_size_bytes_job,
+                                       archive_size_bytes_job, sha256)
+                    manifest.save(manifest_file)
+                    num_errors += upload_manifest(manifest, manifest_file, buffer_path,
+                                                  uploader)
+
+            if not upload_success:
+                # The chunks form one stream and have to be uploaded in order, so do
+                # not continue with the next one. backup_resume re-runs `zfs send` and
+                # skips everything uploaded so far.
+                num_errors += 1
+                break
+    finally:
+        # Whether we are done or gave up, stop the archiver and make sure it does not
+        # keep filling the buffer with archives nobody will upload
+        stream.stop()
+        while archive_thread.is_alive():
+            drain_archive_queue(archive_queue)
+            archive_thread.join(timeout=1)
+        drain_archive_queue(archive_queue)
+
+    if num_errors == 0:
+        manifest.complete = True
+        manifest.save(manifest_file)
+        num_errors += upload_manifest(manifest, manifest_file, buffer_path, uploader)
+
+    return num_errors
+
+
+def load_or_create_manifest(manifest_file, snapshot, chunk_size_bytes, recursive,
+                            send_extra_args):
+    '''Creates the manifest, or picks up the one left behind by an interrupted run.'''
+    if not os.path.exists(manifest_file):
+        total_size_bytes = estimate_stream_size(snapshot, recursive, send_extra_args)
+        print(f'Estimated stream size: {size_to_string(total_size_bytes)}')
+        manifest = StreamManifest(snapshot, chunk_size_bytes, total_size_bytes,
+                                  recursive, send_extra_args)
+        manifest.save(manifest_file)
+        return manifest
+
+    manifest = StreamManifest.load(manifest_file)
+    if manifest.snapshot != snapshot:
+        raise BackupException(f"Manifest '{manifest_file}' belongs to snapshot"
+                              f" '{manifest.snapshot}', but '{snapshot}' should be"
+                              ' backed up. Please run a scratch backup.')
+    if manifest.chunk_size_bytes != chunk_size_bytes:
+        print('WARNING: UPLOAD_LIMIT_MB changed since this backup was started, keeping'
+              f' the chunk size of {size_to_string(manifest.chunk_size_bytes)}')
+    print(f'Resuming, {len(manifest.chunks)} chunk(s) already uploaded'
+          f' ({size_to_string(manifest.uploaded_bytes())})')
+    return manifest
+
+
+def upload_zfs_stream(set_path, buffer_path, chunk_size_bytes, uploader):
+    snapshot = os.environ['ZFS_SEND_SNAPSHOT']
+    recursive = os.environ.get('ZFS_SEND_RECURSIVE', '1') == '1'
+    send_extra_args = split_extra_args(os.environ.get('ZFS_SEND_EXTRA_ARGS'))
+
+    manifest_filename = f'{make_archive_prefix(snapshot)}{MANIFEST_SUFFIX}'
+    manifest_file = os.path.join(set_path, manifest_filename)
+    manifest = load_or_create_manifest(manifest_file, snapshot, chunk_size_bytes,
+                                       recursive, send_extra_args)
+    if manifest.complete:
+        # All chunks are up, only uploading the restore config was left to do. No point
+        # in reading the whole pool again just to find that out.
+        print('All chunks were already uploaded by a previous run')
+        return 0
+
+    cmd = make_send_cmd(snapshot, manifest.recursive, manifest.send_extra_args)
+    with ZfsSendStream(cmd) as stream:
+        return package_and_upload_stream(stream, manifest, manifest_file, buffer_path,
+                                         uploader)
+
+
 def upload_restore_config(s3_bucket, bucket_dir, timestamp, settings, buffer_path,
-                          uploader):
+                          uploader, template='restore.tmpl'):
     buffer_path_base = os.path.dirname(buffer_path)
     impl_path = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(impl_path, 'restore.tmpl')) as f:
+    with open(os.path.join(impl_path, template)) as f:
         template_str = f.read()
     config = template_str.format(s3_bucket=s3_bucket, bucket_dir=bucket_dir,
                                  timestamp=timestamp, buffer_path_base=buffer_path_base)
@@ -370,7 +612,6 @@ def upload_restore_config(s3_bucket, bucket_dir, timestamp, settings, buffer_pat
 
 
 if __name__ == '__main__':
-    snapshot_path = os.path.normpath(os.environ['SNAPSHOT_PATH'])
     set_path = os.environ['SET_PATH']
     buffer_path = os.environ['BUFFER_PATH']
     s3_bucket = os.environ['S3_BUCKET']
@@ -379,11 +620,7 @@ if __name__ == '__main__':
     timestamp = os.environ['TIMESTAMP']
     settings = os.environ['SETTINGS']
     upload_limit = int(os.environ['UPLOAD_LIMIT_MB']) * 1024 * 1024
-    seal_action = SealAction()
-    if seal_action.is_skip_sealed():
-        extra_args = ('--exclude=*/.GDAB_SEALED', '--exclude=*/.GDAB_SEALED/*')
-    else:
-        extra_args = ()
+    backup_mode = BackupMode()
     _, _, bytes_free = shutil.disk_usage(buffer_path)
     if bytes_free < upload_limit:
         raise BackupException(f'Not enough disk space in buffer path {buffer_path} '
@@ -391,10 +628,23 @@ if __name__ == '__main__':
                               f'bytes_free={size_to_string(bytes_free)})')
 
     with Uploader(s3_bucket, bucket_dir, timestamp) as uploader:
-        num_errors = package_and_upload(snapshot_path, set_path, buffer_path, uploader,
-                                        extra_args)
+        if backup_mode.is_zfs_stream():
+            restore_template = 'restore_zfs_stream.tmpl'
+            num_errors = upload_zfs_stream(set_path, buffer_path, upload_limit,
+                                           uploader)
+        else:
+            restore_template = 'restore.tmpl'
+            snapshot_path = os.path.normpath(os.environ['SNAPSHOT_PATH'])
+            seal_action = SealAction()
+            if seal_action.is_skip_sealed():
+                extra_args = ('--exclude=*/.GDAB_SEALED', '--exclude=*/.GDAB_SEALED/*')
+            else:
+                extra_args = ()
+            num_errors = package_and_upload(snapshot_path, set_path, buffer_path,
+                                            uploader, extra_args)
 
         num_errors += upload_restore_config(s3_bucket, bucket_dir.rstrip('/'),
-                                            timestamp, settings, buffer_path, uploader)
+                                            timestamp, settings, buffer_path, uploader,
+                                            restore_template)
 
     sys.exit(0 if num_errors == 0 else 1)
