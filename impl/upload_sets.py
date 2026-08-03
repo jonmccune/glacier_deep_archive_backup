@@ -145,24 +145,23 @@ class Uploader:
         return time.time() - t0
 
 
-def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra_args):  # pylint: disable=too-many-statements
-    num_errors = 0
-    list_files = get_list_files(set_path)
+class ProgressPrinter():  # pylint: disable=too-many-instance-attributes
+    '''Tracks archiving/upload progress and renders the status line.
 
-    total_size_bytes = 0
-    for list_file in list_files:
-        info = get_set_info_for(list_file)
-        total_size_bytes += info['size_bytes']
+    Shared by all backup modes, which only differ in how the archives are produced.
+    '''
+    def __init__(self, total_size_bytes):
+        self.total_size_bytes = total_size_bytes
+        self.archived_bytes = 0  # uncompressed
+        self.archive_size_bytes = 0  # compressed
+        self.gross_uploaded_bytes = 0  # uncompressed
+        self.net_uploaded_bytes = 0
+        self.archive_time_sec = 0
+        self.upload_time_sec = 0
+        self.start_time_sec = time.time()
 
-    archived_bytes = 0  # uncompressed
-    archive_size_bytes = 0  # compressed
-    gross_uploaded_bytes = 0  # uncompressed
-    net_uploaded_bytes = 0
-    archive_time_sec = 0
-    upload_time_sec = 0
-    start_time_sec = time.time()
-
-    def seconds_to_days(seconds):
+    @staticmethod
+    def _seconds_to_days(seconds):
         days, remainder = divmod(seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
         minutes, _ = divmod(remainder, 60)
@@ -174,49 +173,57 @@ def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra
         comps.append(f'{int(minutes)}m')
         return ' '.join(comps)
 
-    def print_status():
-        elapsed_time_sec = time.time() - start_time_sec
-        active_str = seconds_to_days(elapsed_time_sec)
+    def print_status(self):
+        elapsed_time_sec = time.time() - self.start_time_sec
+        active_str = ProgressPrinter._seconds_to_days(elapsed_time_sec)
 
-        factor, unit = size_to_unit(total_size_bytes)
-        archived_str = (f'{size_to_string_factor(archived_bytes, factor, None)}'
-                        f'/{size_to_string_factor(total_size_bytes, factor, unit)}')
+        factor, unit = size_to_unit(self.total_size_bytes)
+        archived_str = (
+            f'{size_to_string_factor(self.archived_bytes, factor, None)}'
+            f'/{size_to_string_factor(self.total_size_bytes, factor, unit)}')
         try:
-            archived_perc = 100 * archived_bytes / total_size_bytes
+            archived_perc = 100 * self.archived_bytes / self.total_size_bytes
         except ZeroDivisionError:
             archived_perc = 100
-        if archive_time_sec > 0:
-            archived_per_sec_str = f'{size_to_string(archived_bytes / archive_time_sec)}'
+        if self.archive_time_sec > 0:
+            archived_per_sec_str = (
+                f'{size_to_string(self.archived_bytes / self.archive_time_sec)}')
         else:
             archived_per_sec_str = '? MiB'
-        uploaded_str = (f'{size_to_string_factor(gross_uploaded_bytes, factor, None)}'
-                        f'/{size_to_string_factor(total_size_bytes, factor, unit)}')
+        uploaded_str = (
+            f'{size_to_string_factor(self.gross_uploaded_bytes, factor, None)}'
+            f'/{size_to_string_factor(self.total_size_bytes, factor, unit)}')
         try:
-            upload_perc = 100 * gross_uploaded_bytes / total_size_bytes
+            upload_perc = 100 * self.gross_uploaded_bytes / self.total_size_bytes
         except ZeroDivisionError:
             upload_perc = 100
-        if upload_time_sec > 0:
-            upload_per_sec_str = f'{size_to_string(net_uploaded_bytes / upload_time_sec)}'
+        if self.upload_time_sec > 0:
+            upload_per_sec_str = (
+                f'{size_to_string(self.net_uploaded_bytes / self.upload_time_sec)}')
         else:
             upload_per_sec_str = '? MiB'
-        if archive_size_bytes > 0:
-            ratio_str = f'{archived_bytes / archive_size_bytes:.1f}x'
+        if self.archive_size_bytes > 0:
+            ratio_str = f'{self.archived_bytes / self.archive_size_bytes:.1f}x'
         else:
             ratio_str = '?'
-        if (archived_bytes > 0 and archive_time_sec > 0 and upload_time_sec > 0
-                and gross_uploaded_bytes > 0 and net_uploaded_bytes > 0):
-            archived_bytes_per_sec = archived_bytes / archive_time_sec
-            eta_archiving_sec = ((total_size_bytes - archived_bytes)
+        if (self.archived_bytes > 0 and self.archive_time_sec > 0
+                and self.upload_time_sec > 0 and self.gross_uploaded_bytes > 0
+                and self.net_uploaded_bytes > 0):
+            archived_bytes_per_sec = self.archived_bytes / self.archive_time_sec
+            eta_archiving_sec = ((self.total_size_bytes - self.archived_bytes)
                                  / archived_bytes_per_sec)
-            gross_remaining_upload_bytes = total_size_bytes - gross_uploaded_bytes
+            gross_remaining_upload_bytes = (self.total_size_bytes
+                                            - self.gross_uploaded_bytes)
             # Pessimistic: Remaining compression is 1x
-            net_uploaded_bytes_per_sec = net_uploaded_bytes / upload_time_sec
+            net_uploaded_bytes_per_sec = self.net_uploaded_bytes / self.upload_time_sec
             max_eta_upload_sec = gross_remaining_upload_bytes / net_uploaded_bytes_per_sec
             # Optimistic: Compression ratio is constant as for data before
             min_eta_upload_sec = (max_eta_upload_sec *
-                                  (net_uploaded_bytes / gross_uploaded_bytes))
-            min_eta_str = seconds_to_days(eta_archiving_sec + min_eta_upload_sec)
-            max_eta_str = seconds_to_days(eta_archiving_sec + max_eta_upload_sec)
+                                  (self.net_uploaded_bytes / self.gross_uploaded_bytes))
+            min_eta_str = ProgressPrinter._seconds_to_days(eta_archiving_sec
+                                                           + min_eta_upload_sec)
+            max_eta_str = ProgressPrinter._seconds_to_days(eta_archiving_sec
+                                                           + max_eta_upload_sec)
         else:
             min_eta_str = '?'
             max_eta_str = '?'
@@ -231,6 +238,18 @@ def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra
                f', {upload_per_sec_str}/s), Ratio: {ratio_str}, ETA: {eta_str}')
 
         print(msg)
+
+
+def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra_args):  # pylint: disable=too-many-statements
+    num_errors = 0
+    list_files = get_list_files(set_path)
+
+    total_size_bytes = 0
+    for list_file in list_files:
+        info = get_set_info_for(list_file)
+        total_size_bytes += info['size_bytes']
+
+    progress = ProgressPrinter(total_size_bytes)
 
     # Upload will usually be slower than archive building. So build the archives in the
     # background, so that we will always have an archive ready for upload.
@@ -259,10 +278,10 @@ def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra
         upload_success = False
 
         try:
-            archive_time_sec += archive_time_sec_job
-            archive_size_bytes += archive_size_bytes_job
-            archived_bytes += archived_bytes_job
-            print_status()
+            progress.archive_time_sec += archive_time_sec_job
+            progress.archive_size_bytes += archive_size_bytes_job
+            progress.archived_bytes += archived_bytes_job
+            progress.print_status()
 
             for i in range(NUM_UPLOAD_RETRIES):
                 print(f'Set {archive_index}/{len(list_files)}: Uploading {archive_name}'
@@ -275,14 +294,14 @@ def package_and_upload(snapshot_path, set_path, buffer_path, uploader, tar_extra
                                                            deep_archive=True)
 
                     upload_success = True
-                    net_uploaded_bytes += os.path.getsize(archive_file)
-                    gross_uploaded_bytes += archived_bytes_job
-                    upload_time_sec += file_upload_time_sec
+                    progress.net_uploaded_bytes += os.path.getsize(archive_file)
+                    progress.gross_uploaded_bytes += archived_bytes_job
+                    progress.upload_time_sec += file_upload_time_sec
                     break
                 except subprocess.CalledProcessError as e:
                     print(f'Error during upload: {e}')
                 finally:
-                    print_status()
+                    progress.print_status()
         finally:
             # Delete archive in any case, retry will recreate it and we need the space
             os.unlink(archive_file)
