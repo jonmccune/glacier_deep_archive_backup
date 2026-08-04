@@ -19,13 +19,26 @@ RESTORATION_PERIOD_DAYS = 3
 NUM_DOWNLOAD_RETRIES = 3
 
 
+def run_aws(cmd):
+    '''subprocess.run wrapper for `aws` calls whose output needs to be parsed.
+
+    A bare `capture_output=True` + `check=True` silently swallows the AWS CLI's own
+    error message on failure (it does not appear in the default traceback), which
+    makes real failures such as an IAM permission gap look inexplicable. Surface it.
+    '''
+    try:
+        return subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise BackupException(f"'{' '.join(cmd)}' failed with exit code"
+                              f' {e.returncode}:\n{e.stderr.decode()}') from e
+
+
 def get_files(s3_bucket, bucket_dir, timestamp):
     prefix = f'{bucket_dir.strip("/")}/{timestamp.strip("/")}'
     cmd = ('aws', 's3api', 'list-objects-v2', '--bucket', s3_bucket, '--prefix', prefix,
            '--query', "Contents[?StorageClass=='DEEP_ARCHIVE'].[Key, Size]",
            '--no-paginate', '--output', 'json')
-    cp = subprocess.run(cmd, capture_output=True, check=True)
-    cp.check_returncode()
+    cp = run_aws(cmd)
     file_list = json.loads(cp.stdout.decode())
 
     return file_list
@@ -37,8 +50,7 @@ def get_manifest_key(s3_bucket, bucket_dir, timestamp):
     query = f"Contents[?ends_with(Key, '{MANIFEST_ARCHIVE_SUFFIX}')].Key"
     cmd = ('aws', 's3api', 'list-objects-v2', '--bucket', s3_bucket, '--prefix', prefix,
            '--query', query, '--no-paginate', '--output', 'json')
-    cp = subprocess.run(cmd, capture_output=True, check=True)
-    cp.check_returncode()
+    cp = run_aws(cmd)
     keys = json.loads(cp.stdout.decode()) or []
     if len(keys) != 1:
         raise BackupException(f'Expected exactly one stream manifest below {prefix} in'
@@ -55,17 +67,16 @@ def request_restore(s3_bucket, file_, days, restore_tier, files_to_restore):
     cmd = ('aws', 's3api', 'restore-object', '--bucket', s3_bucket, '--key', file_,
            '--restore-request', restore_request)
     try:
-        subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        if not 'RestoreAlreadyInProgress' in e.stderr.decode():
+        run_aws(cmd)
+    except BackupException as e:
+        if 'RestoreAlreadyInProgress' not in str(e):
             raise
     files_to_restore.append(file_)
 
 
 def is_restored(s3_bucket, file_):
     cmd = ('aws', 's3api', 'head-object', '--bucket', s3_bucket, '--key', file_)
-    cp = subprocess.run(cmd, capture_output=True, check=True)
-    cp.check_returncode()
+    cp = run_aws(cmd)
     status = json.loads(cp.stdout.decode())
     return 'ongoing-request="false"' in status.get('Restore', '')
 

@@ -547,6 +547,39 @@ def test_is_restored(bucket, work_path):
     assert do_restore.is_restored('test_bucket', 'dir/ts/a.zfs.zstd.gpg')
 
 
+def test_request_restore_succeeds(bucket, work_path):
+    del work_path, bucket
+    files_to_restore = []
+
+    do_restore.request_restore('test_bucket', 'dir/ts/a.zfs.zstd.gpg', 3, 'Standard',
+                               files_to_restore)
+
+    assert files_to_restore == ['dir/ts/a.zfs.zstd.gpg']
+
+
+def test_request_restore_surfaces_the_real_aws_error(bucket, work_path, monkeypatch):
+    del work_path, bucket
+    # A permission gap (or any error other than a restore already being in
+    # progress) must not be swallowed - this is what silently hid a real
+    # AccessDenied error behind a bare traceback before.
+    monkeypatch.setenv('GDAB_RESTORE_OBJECT_ERROR', 'AccessDenied')
+
+    with pytest.raises(BackupException, match='AccessDenied'):
+        do_restore.request_restore('test_bucket', 'dir/ts/a.zfs.zstd.gpg', 3,
+                                   'Standard', [])
+
+
+def test_request_restore_ignores_already_in_progress(bucket, work_path, monkeypatch):
+    del work_path, bucket
+    monkeypatch.setenv('GDAB_RESTORE_OBJECT_ERROR', 'RestoreAlreadyInProgress')
+    files_to_restore = []
+
+    do_restore.request_restore('test_bucket', 'dir/ts/a.zfs.zstd.gpg', 3, 'Standard',
+                               files_to_restore)
+
+    assert files_to_restore == ['dir/ts/a.zfs.zstd.gpg']
+
+
 def test_download(bucket, work_path):
     put_object(bucket, 'dir/ts/a.zfs.zstd.gpg', b'payload', deep_archive=True)
     dest = os.path.join(work_path, 'download')

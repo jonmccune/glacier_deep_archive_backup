@@ -112,6 +112,17 @@ def cmd_ok(argv):
     return 0
 
 
+def cmd_restore_object(argv):
+    del argv
+    # Lets a test simulate a restore-object failure, e.g. an IAM permission gap or a
+    # restore already being in progress for this key.
+    error = os.environ.get('GDAB_RESTORE_OBJECT_ERROR')
+    if error:
+        print(f'aws stub: simulated error: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_list_multipart_uploads(argv):
     del argv
     # Real `aws s3api list-multipart-uploads` omits the 'Uploads' key entirely (not
@@ -125,7 +136,7 @@ COMMANDS = {
     ('s3', 'cp'): cmd_s3_cp,
     ('s3api', 'list-objects-v2'): cmd_list_objects,
     ('s3api', 'list-multipart-uploads'): cmd_list_multipart_uploads,
-    ('s3api', 'restore-object'): cmd_ok,
+    ('s3api', 'restore-object'): cmd_restore_object,
     ('s3api', 'head-object'): cmd_head_object,
     ('sts', 'get-caller-identity'): cmd_ok,
 }
