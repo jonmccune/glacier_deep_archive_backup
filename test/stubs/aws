@@ -109,14 +109,22 @@ def cmd_head_object(argv):
 
 def cmd_ok(argv):
     del argv
-    # For list-multipart-uploads, no output means there is nothing to clean up
+    return 0
+
+
+def cmd_list_multipart_uploads(argv):
+    del argv
+    # Real `aws s3api list-multipart-uploads` omits the 'Uploads' key entirely (not
+    # an empty list) when there is nothing in progress - callers must not assume the
+    # key is present.
+    print(json.dumps({}))
     return 0
 
 
 COMMANDS = {
     ('s3', 'cp'): cmd_s3_cp,
     ('s3api', 'list-objects-v2'): cmd_list_objects,
-    ('s3api', 'list-multipart-uploads'): cmd_ok,
+    ('s3api', 'list-multipart-uploads'): cmd_list_multipart_uploads,
     ('s3api', 'restore-object'): cmd_ok,
     ('s3api', 'head-object'): cmd_head_object,
     ('sts', 'get-caller-identity'): cmd_ok,
