@@ -9,6 +9,13 @@ shift
 case "$SUBCOMMAND" in
     snapshot|destroy)
         echo "zfs $SUBCOMMAND $*" >>"$GDAB_TEST_DIR/${SUBCOMMAND}_invocations"
+        if [[ "$SUBCOMMAND" == snapshot && -n "${GDAB_BUFFER_EXISTS_CHECK:-}" ]]; then
+            if [[ -e "$GDAB_BUFFER_EXISTS_CHECK" ]]; then
+                echo yes >"$GDAB_TEST_DIR/buffer_existed_at_snapshot"
+            else
+                echo no >"$GDAB_TEST_DIR/buffer_existed_at_snapshot"
+            fi
+        fi
         exit 0
         ;;
     send)

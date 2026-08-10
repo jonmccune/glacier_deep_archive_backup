@@ -69,8 +69,6 @@ if [[ "$BACKUP_MODE" == zfs_stream ]]; then
 fi
 
 BUFFER_PATH="$BUFFER_PATH_BASE/backup_aws_buffer"
-rm -rf "$BUFFER_PATH"
-mkdir -p "$BUFFER_PATH"
 
 function cleanup()
 {
@@ -106,6 +104,13 @@ if [[ "$MODE" == scratch ]] || [[ "$MODE" == duplicity_full ]] || [[ "$MODE" == 
         sudo zfs snapshot "$SNAPSHOT"
     fi
 fi
+
+# Created only now, after the snapshot exists: if BUFFER_PATH_BASE happens to live
+# inside the dataset(s) just snapshotted (e.g. BACKUP_MODE=zfs_stream backing up the
+# whole pool, with the buffer also on that pool), the buffer must not itself become
+# part of the snapshot it is buffering data for.
+rm -rf "$BUFFER_PATH"
+mkdir -p "$BUFFER_PATH"
 
 if [[ "$BACKUP_MODE" == files ]]; then
     # zfs_stream reads the snapshot with `zfs send`, which needs no mount and also

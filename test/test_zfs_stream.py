@@ -805,5 +805,34 @@ def test_end_to_end_single_dataset(work_path):
         assert '-R' not in content, f'{name}: {content}'
 
 
+def test_buffer_is_created_after_the_snapshot(work_path):
+    '''The buffer must not exist yet when the snapshot is taken.
+
+    BUFFER_PATH_BASE can live inside the dataset(s) being backed up (e.g. the whole
+    pool, with the buffer also on that pool) - if the buffer directory already existed
+    at snapshot time, it would itself become part of the snapshot it is buffering data
+    for.
+    '''
+    make_stream_file(work_path, 1024 * 1024)
+    repo_path = make_test_repo(work_path)
+    env = make_env(work_path, repo_path)
+    config_path = write_backup_config(repo_path, work_path, 1)
+    env['GDAB_BUFFER_EXISTS_CHECK'] = os.path.join(work_path, 'backup_aws_buffer')
+
+    cp = subprocess.run(('impl/do_backup_to_aws.sh', 'scratch', config_path),
+                        cwd=repo_path, env=env, check=False, capture_output=True,
+                        text=True)
+    if cp.returncode != 0:
+        raise TestException(f'Backup failed:\n{cp.stdout}\n{cp.stderr}')
+
+    with open(os.path.join(work_path, 'buffer_existed_at_snapshot'), 'rt') as f:
+        assert f.read().strip() == 'no'
+
+    # The buffer must still actually get created and used for the backup to work at
+    # all - the successful return code above already proves this (chunking/archiving
+    # cannot succeed without it), so this is testing that it is absent specifically at
+    # the moment the snapshot is taken, not that it is never created.
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, *sys.argv[1:]]))
