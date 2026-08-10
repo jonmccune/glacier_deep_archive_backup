@@ -10,7 +10,7 @@ import tempfile
 import pytest
 
 from impl import do_restore
-from impl.tools import BackupException, BackupMode
+from impl.tools import BackupException, BackupMode, size_to_string
 from impl.upload_sets import package_and_upload_stream
 from impl.zfs_stream import (MANIFEST_SUFFIX, StreamManifest, ZfsReceiveStream,
                              ZfsSendStream, build_manifest_archive,
@@ -832,6 +832,49 @@ def test_buffer_is_created_after_the_snapshot(work_path):
     # all - the successful return code above already proves this (chunking/archiving
     # cannot succeed without it), so this is testing that it is absent specifically at
     # the moment the snapshot is taken, not that it is never created.
+
+
+def test_check_progress_reports_in_progress_backup(work_path):
+    '''check_progress reports sensible numbers for a backup stopped partway through.'''
+    _, data = make_stream_file(work_path, 2 * 1024 * 1024 + 512 * 1024)
+    repo_path = make_test_repo(work_path)
+    env = make_env(work_path, repo_path)
+    config_path = write_backup_config(repo_path, work_path, 1)
+
+    # Interrupt after two chunks, same technique as test_end_to_end_resume
+    fail_marker = os.path.join(work_path, 'fail_after')
+    with open(fail_marker, 'wt') as f:
+        print('2', file=f)
+    env['GDAB_FAIL_DEEP_ARCHIVE_AFTER'] = fail_marker
+
+    cp = subprocess.run(('impl/do_backup_to_aws.sh', 'scratch', config_path),
+                        cwd=repo_path, env=env, check=False, capture_output=True,
+                        text=True)
+    assert cp.returncode != 0, cp.stdout
+    assert os.path.exists(os.path.join(repo_path, 'state', 'resume_info'))
+
+    cp = subprocess.run(('./check_progress',), cwd=repo_path, env=env, check=False,
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise TestException(f'check_progress failed:\n{cp.stdout}\n{cp.stderr}')
+
+    assert 'Chunks uploaded so far: 2' in cp.stdout, cp.stdout
+    # Two 1 MiB chunks (UPLOAD_LIMIT_MB=1 in write_backup_config) were uploaded
+    assert 'Bytes uploaded so far: 2.00 MiB' in cp.stdout, cp.stdout
+    # The estimate reports the raw (pre-chunking) stream size, matching the full test
+    # data regardless of how much of it has actually been uploaded so far
+    assert f'Estimated total size: {size_to_string(len(data))}' in cp.stdout, cp.stdout
+
+
+def test_check_progress_with_no_backup_running(work_path):
+    repo_path = make_test_repo(work_path)
+    env = make_env(work_path, repo_path)
+
+    cp = subprocess.run(('./check_progress',), cwd=repo_path, env=env, check=False,
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise TestException(f'check_progress failed:\n{cp.stdout}\n{cp.stderr}')
+    assert 'No backup currently in progress' in cp.stdout, cp.stdout
 
 
 if __name__ == '__main__':

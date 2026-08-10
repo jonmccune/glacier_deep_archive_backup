@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH+=:$ROOT
+pushd "$ROOT" >/dev/null
+trap 'popd >/dev/null' EXIT
+
+RESUME_FILE=state/resume_info
+
+if [[ ! -s "$RESUME_FILE" ]]; then
+    echo "No backup currently in progress (state/resume_info not found)."
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$RESUME_FILE"
+# shellcheck disable=SC1090
+source "$SETTINGS"
+
+BACKUP_MODE=${BACKUP_MODE:-files}
+if [[ "$BACKUP_MODE" != zfs_stream ]]; then
+    echo "check_progress only supports BACKUP_MODE=zfs_stream (this backup uses" \
+        "$BACKUP_MODE)."
+    exit 1
+fi
+
+ZFS_SEND_DATASET=${ZFS_SEND_DATASET:-$ZFS_POOL}
+ZFS_SEND_RECURSIVE=${ZFS_SEND_RECURSIVE:-1}
+ZFS_SEND_SNAPSHOT=$ZFS_SEND_DATASET@snapshot-aws-$TIMESTAMP
+
+impl/check_progress.py "$ZFS_SEND_SNAPSHOT" "$TIMESTAMP" "$ZFS_SEND_RECURSIVE"
