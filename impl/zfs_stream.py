@@ -79,6 +79,29 @@ def parse_send_estimate(output):
     return None
 
 
+def estimate_stream_size_unprivileged(snapshot, recursive=True):
+    '''Like estimate_stream_size, but needs no `sudo` access at all.
+
+    `zfs send -nP` requires the same privilege as a real send, which is often not
+    available to whatever is merely checking on progress (e.g. a different SSH
+    session than the one running the backup, with no cached sudo credential of its
+    own). Reading `logicalreferenced` off the already-taken snapshot(s) needs no
+    privilege at all, and gives the same "size of the data, uncompressed" figure that
+    `zfs send -nP` reports.
+    '''
+    dataset, snapshot_suffix = snapshot.split('@', maxsplit=1)
+    cmd = ['zfs', 'list', '-Hp', '-t', 'snapshot', '-o', 'name,logicalreferenced']
+    cmd.extend(['-r', dataset] if recursive else [snapshot])
+    cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    total = 0
+    for line in cp.stdout.splitlines():
+        name, size = line.split('\t')
+        if recursive and not name.endswith(f'@{snapshot_suffix}'):
+            continue
+        total += int(size)
+    return total
+
+
 def estimate_stream_size(snapshot, recursive=True, extra_args=()):
     '''Returns the estimated size of the stream in bytes, for progress reporting.
 

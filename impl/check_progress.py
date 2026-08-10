@@ -2,18 +2,22 @@
 '''Reports the progress of an in-progress BACKUP_MODE=zfs_stream backup.
 
 Reads the local manifest (updated after every uploaded chunk, so this is safe to run
-concurrently with a live backup) and compares it against a fresh `zfs send -nP` size
+concurrently with a live backup) and compares it against a fresh, unprivileged size
 estimate of the already-taken snapshot, to report bytes uploaded, percentage, current
 rate, and estimated time remaining. Does not touch the live backup in any way - this
-is a read-only status check.
+is a read-only status check, and deliberately needs no `sudo` access (unlike the
+backup itself), so it can be run from any session, not just the one running the
+backup with a cached sudo credential.
 '''
 
+import subprocess
 import sys
 import time
 from datetime import datetime
 
-from impl.tools import BackupException, size_to_string
-from impl.zfs_stream import StreamManifest, estimate_stream_size, make_archive_prefix
+from impl.tools import size_to_string
+from impl.zfs_stream import (StreamManifest, estimate_stream_size_unprivileged,
+                             make_archive_prefix)
 
 SET_PATH = 'state/sets'
 
@@ -63,11 +67,10 @@ def main():
         print(f'Average rate since start: {size_to_string(rate)}/s')
 
     print()
-    print('Estimating total snapshot size (zfs send -nP, may take a moment)...')
     try:
-        total_bytes = estimate_stream_size(snapshot, recursive=recursive)
-    except BackupException as e:
-        print(f'Could not estimate total size: {e}')
+        total_bytes = estimate_stream_size_unprivileged(snapshot, recursive=recursive)
+    except subprocess.CalledProcessError as e:
+        print(f'Could not estimate total size: {e.stderr}')
         return 0
 
     print(f'Estimated total size: {size_to_string(total_bytes)}')

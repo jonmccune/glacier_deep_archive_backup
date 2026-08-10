@@ -38,6 +38,28 @@ case "$SUBCOMMAND" in
         echo "zfs receive $*" >>"$GDAB_TEST_DIR/receive_invocations"
         cat >"$GDAB_TEST_DIR/received.bin"
         ;;
+    list)
+        # Only "-Hp -t snapshot -o name,logicalreferenced [-r] TARGET" is supported,
+        # for estimate_stream_size_unprivileged(). The dataset/snapshot argument is
+        # always last, regardless of which flags precede it.
+        RECURSIVE=0
+        for ARG in "$@"; do
+            [[ "$ARG" == "-r" ]] && RECURSIVE=1
+        done
+        TARGET="${*: -1}"
+        SIZE=$(wc -c <"$GDAB_TEST_DIR/pool.bin" | tr -d ' ')
+        if [[ "$RECURSIVE" == 1 ]]; then
+            # Recover the snapshot name(s) actually taken, the same way the real `zfs
+            # list -r` would show them, from what `zfs snapshot` was invoked with.
+            LAST_SNAPSHOT=$(tail -1 "$GDAB_TEST_DIR/snapshot_invocations" 2>/dev/null \
+                | awk '{print $NF}')
+            SUFFIX="${LAST_SNAPSHOT#*@}"
+            printf '%s@%s\t%s\n' "$TARGET" "$SUFFIX" "$SIZE"
+        else
+            printf '%s\t%s\n' "$TARGET" "$SIZE"
+        fi
+        exit 0
+        ;;
     *)
         echo "zfs stub: unhandled subcommand $SUBCOMMAND" >&2
         exit 1
